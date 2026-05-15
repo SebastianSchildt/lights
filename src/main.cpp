@@ -16,6 +16,10 @@ constexpr uint32_t ALT_SLOW_TOGGLE_MS = 1000;  // Visible toggle: 1000ms per pol
 constexpr uint32_t ALT_TOGGLE_MS = 250;        // Visible toggle: 250ms per polarity (perceptible alternation)
 constexpr uint32_t FADE_HALF_CYCLE_MS = 15000; // 15s: even -> odd (full back-and-forth cycle is 30s)
 constexpr uint32_t FADE_MIX_FRAME_US = 2000;   // 2ms frame for polarity mixing (~500 Hz)
+const uint32_t PUMP_HEARTBEAT_CYCLE_MS = 1000;   // Fast heartbeat: 1s total cycle
+const uint32_t PUMP_BREATHING_CYCLE_MS = 4000;   // Slow breathing: 4s total cycle
+constexpr uint16_t PUMP_MIN_PERMILLE = 100;    // 10% minimum brightness
+constexpr uint32_t BOTH_SLOT_US = 100;         // Slot length for A/B alternation in both-LED mode
 
 // Operating modes for the LED strips
 // - BothOnFast: Both LEDs on via rapid polarity switching (looks steady)
@@ -24,6 +28,8 @@ constexpr uint32_t FADE_MIX_FRAME_US = 2000;   // 2ms frame for polarity mixing 
 // - AlternateVisibleSlow: Alternating polarities at visible rate (1000ms each)
 // - AlternateVisible: Alternating polarities at visible rate (250ms each)
 // - FadeEvenOdd: Slow crossfade between even and odd LEDs
+// - PumpHeartbeat: Fast punchy heartbeat pulse (1s cycle)
+// - PumpBreathing: Slow gentle breathing pulse (4s cycle)
 // - AllOff: All LEDs off
 enum class Mode : uint8_t {
   BothOnFast = 0,
@@ -32,6 +38,8 @@ enum class Mode : uint8_t {
   AlternateVisibleSlow,
   AlternateVisible,
   FadeEvenOdd,
+  PumpHeartbeat,
+  PumpBreathing,
   AllOff,
   Count
 };
@@ -49,6 +57,7 @@ bool polarityAActive = true;                // Track current polarity direction
 uint32_t lastFastToggleUs = 0;              // Timestamp of last fast toggle (microseconds)
 uint32_t lastAltToggleMs = 0;               // Timestamp of last visible toggle (milliseconds)
 uint32_t fadeCycleStartMs = 0;              // Timestamp when fade cycle started
+uint32_t pumpCycleStartMs = 0;              // Timestamp when pump cycle started
 
 const char *modeToString(Mode mode) {
   switch (mode) {
@@ -66,6 +75,10 @@ const char *modeToString(Mode mode) {
       return "AlternateVisible";
     case Mode::FadeEvenOdd:
       return "FadeEvenOdd";
+    case Mode::PumpHeartbeat:
+      return "PumpHeartbeat";
+    case Mode::PumpBreathing:
+      return "PumpBreathing";
     case Mode::Count:
       return "Unknown";
   }
@@ -115,6 +128,26 @@ void applyMixedPolarity(uint16_t dutyApermille, uint32_t nowUs) {
   }
 }
 
+// Control overall brightness for both LED polarities together.
+// brightnessPermille: 0..1000 where 1000 = fully on (A/B alternated), 0 = off.
+void applyBothBrightness(uint16_t brightnessPermille, uint32_t nowUs) {
+  uint32_t framePosUs = nowUs % FADE_MIX_FRAME_US;
+  uint32_t onWindowUs = (static_cast<uint32_t>(brightnessPermille) * FADE_MIX_FRAME_US) / 1000;
+
+  if (framePosUs >= onWindowUs) {
+    driveOff();
+    return;
+  }
+
+  // While in the ON window, rapidly alternate A/B so both LED directions are lit.
+  uint32_t slotIndex = nowUs / BOTH_SLOT_US;
+  if ((slotIndex & 1U) == 0U) {
+    drivePolarityA();
+  } else {
+    drivePolarityB();
+  }
+}
+
 // Initialize a new operating mode and set initial polarity
 void enterMode(Mode newMode) {
   currentMode = newMode;
@@ -122,6 +155,7 @@ void enterMode(Mode newMode) {
   lastFastToggleUs = micros();   // Reset fast toggle timer
   lastAltToggleMs = millis();    // Reset visible toggle timer
   fadeCycleStartMs = millis();   // Reset fade cycle timer
+  pumpCycleStartMs = millis();   // Reset pump cycle timer
 
   switch (currentMode) {
     case Mode::AllOff:
@@ -145,6 +179,14 @@ void enterMode(Mode newMode) {
     case Mode::FadeEvenOdd:
       // Start with even LEDs at full brightness.
       drivePolarityA();
+      break;
+    case Mode::PumpHeartbeat:
+      // Start pump at minimum brightness.
+      driveOff();
+      break;
+    case Mode::PumpBreathing:
+      // Start pump at minimum brightness.
+      driveOff();
       break;
     case Mode::Count:
       break;
@@ -242,6 +284,60 @@ void updateOutputs() {
       }
 
       applyMixedPolarity(dutyApermille, nowUs);
+      break;
+    }
+    case Mode::PumpHeartbeat: {
+      // Fast punchy heartbeat: 1s cycle, 300ms rise with ease-in, 700ms fast drop.
+      constexpr uint32_t RISE_MS = 300;
+      constexpr uint16_t PUMP_RANGE_PERMILLE = 1000 - PUMP_MIN_PERMILLE;
+
+      uint32_t elapsedMs = (nowMs - pumpCycleStartMs) % PUMP_HEARTBEAT_CYCLE_MS;
+      uint16_t brightnessPermille = PUMP_MIN_PERMILLE;
+
+      if (elapsedMs < RISE_MS) {
+        // Rise: slow start, accelerating (quadratic ease-in) for punch.
+        uint32_t tPermille = (elapsedMs * 1000UL) / RISE_MS;
+        uint32_t easedPermille = (tPermille * tPermille) / 1000UL;
+        brightnessPermille = static_cast<uint16_t>(PUMP_MIN_PERMILLE +
+                                                   (PUMP_RANGE_PERMILLE * easedPermille) / 1000UL);
+      } else {
+        // Fall: fast linear drop from 100% to 10%.
+        uint32_t fallMs = elapsedMs - RISE_MS;
+        uint32_t fallDurationMs = PUMP_HEARTBEAT_CYCLE_MS - RISE_MS;
+        uint32_t tPermille = (fallMs * 1000UL) / fallDurationMs;
+        brightnessPermille = static_cast<uint16_t>(1000U -
+                                                   (PUMP_RANGE_PERMILLE * tPermille) / 1000UL);
+      }
+
+      applyBothBrightness(brightnessPermille, nowUs);
+      break;
+    }
+    case Mode::PumpBreathing: {
+      // Slow gentle breathing: 4s cycle, 2s ease-in rise, 2s ease-out fall.
+      constexpr uint32_t HALF_BREATH_MS = PUMP_BREATHING_CYCLE_MS / 2;
+      constexpr uint16_t PUMP_RANGE_PERMILLE = 1000 - PUMP_MIN_PERMILLE;
+
+      uint32_t elapsedMs = (nowMs - pumpCycleStartMs) % PUMP_BREATHING_CYCLE_MS;
+      uint16_t brightnessPermille = PUMP_MIN_PERMILLE;
+
+      if (elapsedMs < HALF_BREATH_MS) {
+        // Rise: gentle ease-in (slow start, accelerates).
+        uint32_t tPermille = (elapsedMs * 1000UL) / HALF_BREATH_MS;
+        uint32_t easedPermille = (tPermille * tPermille) / 1000UL;
+        brightnessPermille = static_cast<uint16_t>(PUMP_MIN_PERMILLE +
+                                                   (PUMP_RANGE_PERMILLE * easedPermille) / 1000UL);
+      } else {
+        // Fall: gentle ease-out (fast start, decelerates) for smooth breathing.
+        uint32_t fallMs = elapsedMs - HALF_BREATH_MS;
+        uint32_t tPermille = (fallMs * 1000UL) / HALF_BREATH_MS;
+        // Ease-out: 1 - (1-t)^2
+        uint32_t invertedT = 1000UL - tPermille;
+        uint32_t easedPermille = 1000UL - ((invertedT * invertedT) / 1000UL);
+        brightnessPermille = static_cast<uint16_t>(PUMP_MIN_PERMILLE +
+                                                   (PUMP_RANGE_PERMILLE * easedPermille) / 1000UL);
+      }
+
+      applyBothBrightness(brightnessPermille, nowUs);
       break;
     }
     case Mode::Count:
