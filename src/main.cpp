@@ -12,19 +12,26 @@ constexpr uint8_t PIN_MODE_BUTTON = 2; // D2 -> button to GND
 // Timing configuration
 constexpr uint32_t BUTTON_DEBOUNCE_MS = 30;    // Button debounce duration
 constexpr uint32_t BOTH_ON_TOGGLE_US = 2500;   // Fast toggle: ~200 Hz per polarity (imperceptible to eye)
+constexpr uint32_t ALT_SLOW_TOGGLE_MS = 1000;  // Visible toggle: 1000ms per polarity
 constexpr uint32_t ALT_TOGGLE_MS = 250;        // Visible toggle: 250ms per polarity (perceptible alternation)
+constexpr uint32_t FADE_HALF_CYCLE_MS = 15000; // 15s: even -> odd (full back-and-forth cycle is 30s)
+constexpr uint32_t FADE_MIX_FRAME_US = 2000;   // 2ms frame for polarity mixing (~500 Hz)
 
 // Operating modes for the LED strips
 // - BothOnFast: Both LEDs on via rapid polarity switching (looks steady)
 // - EvenOn: Only even-indexed LEDs lit (forward current only)
 // - OddOn: Only odd-indexed LEDs lit (reverse current only)
+// - AlternateVisibleSlow: Alternating polarities at visible rate (1000ms each)
 // - AlternateVisible: Alternating polarities at visible rate (250ms each)
+// - FadeEvenOdd: Slow crossfade between even and odd LEDs
 // - AllOff: All LEDs off
 enum class Mode : uint8_t {
   BothOnFast = 0,
   EvenOn,
   OddOn,
+  AlternateVisibleSlow,
   AlternateVisible,
+  FadeEvenOdd,
   AllOff,
   Count
 };
@@ -41,6 +48,7 @@ uint32_t buttonLastChangeMs = 0;            // Timestamp of last state change
 bool polarityAActive = true;                // Track current polarity direction
 uint32_t lastFastToggleUs = 0;              // Timestamp of last fast toggle (microseconds)
 uint32_t lastAltToggleMs = 0;               // Timestamp of last visible toggle (milliseconds)
+uint32_t fadeCycleStartMs = 0;              // Timestamp when fade cycle started
 
 const char *modeToString(Mode mode) {
   switch (mode) {
@@ -52,8 +60,12 @@ const char *modeToString(Mode mode) {
       return "OddOn";
     case Mode::BothOnFast:
       return "BothOnFast";
+    case Mode::AlternateVisibleSlow:
+      return "AlternateVisibleSlow";
     case Mode::AlternateVisible:
       return "AlternateVisible";
+    case Mode::FadeEvenOdd:
+      return "FadeEvenOdd";
     case Mode::Count:
       return "Unknown";
   }
@@ -90,12 +102,26 @@ void applyPolarityState() {
   }
 }
 
+// Mix polarity A/B within a short time frame to crossfade perceived brightness.
+// dutyApermille: 0..1000 where 1000 = full polarity A, 0 = full polarity B.
+void applyMixedPolarity(uint16_t dutyApermille, uint32_t nowUs) {
+  uint32_t framePosUs = nowUs % FADE_MIX_FRAME_US;
+  uint32_t thresholdUs = (static_cast<uint32_t>(dutyApermille) * FADE_MIX_FRAME_US) / 1000;
+
+  if (framePosUs < thresholdUs) {
+    drivePolarityA();
+  } else {
+    drivePolarityB();
+  }
+}
+
 // Initialize a new operating mode and set initial polarity
 void enterMode(Mode newMode) {
   currentMode = newMode;
   polarityAActive = true;        // Always start with polarity A
   lastFastToggleUs = micros();   // Reset fast toggle timer
   lastAltToggleMs = millis();    // Reset visible toggle timer
+  fadeCycleStartMs = millis();   // Reset fade cycle timer
 
   switch (currentMode) {
     case Mode::AllOff:
@@ -110,7 +136,14 @@ void enterMode(Mode newMode) {
     case Mode::BothOnFast:
       drivePolarityA();
       break;
+    case Mode::AlternateVisibleSlow:
+      drivePolarityA();
+      break;
     case Mode::AlternateVisible:
+      drivePolarityA();
+      break;
+    case Mode::FadeEvenOdd:
+      // Start with even LEDs at full brightness.
       drivePolarityA();
       break;
     case Mode::Count:
@@ -177,6 +210,14 @@ void updateOutputs() {
         applyPolarityState();
       }
       break;
+    case Mode::AlternateVisibleSlow:
+      // Slow polarity toggle (1000ms each): visible alternation between polarities
+      if ((nowMs - lastAltToggleMs) >= ALT_SLOW_TOGGLE_MS) {
+        lastAltToggleMs = nowMs;
+        polarityAActive = !polarityAActive;
+        applyPolarityState();
+      }
+      break;
     case Mode::AlternateVisible:
       // Slow polarity toggle (250ms each): visible alternation between polarities
       if ((nowMs - lastAltToggleMs) >= ALT_TOGGLE_MS) {
@@ -185,6 +226,24 @@ void updateOutputs() {
         applyPolarityState();
       }
       break;
+    case Mode::FadeEvenOdd: {
+      // 15s ramp A->B, then 15s ramp B->A.
+      uint32_t elapsedMs = nowMs - fadeCycleStartMs;
+      uint32_t cyclePosMs = elapsedMs % (2UL * FADE_HALF_CYCLE_MS);
+      uint16_t dutyApermille = 0;
+
+      if (cyclePosMs < FADE_HALF_CYCLE_MS) {
+        // A fades down from 100% to 0% while B fades up.
+        dutyApermille = static_cast<uint16_t>(((FADE_HALF_CYCLE_MS - cyclePosMs) * 1000UL) / FADE_HALF_CYCLE_MS);
+      } else {
+        // A fades up from 0% to 100% while B fades down.
+        uint32_t returnPosMs = cyclePosMs - FADE_HALF_CYCLE_MS;
+        dutyApermille = static_cast<uint16_t>((returnPosMs * 1000UL) / FADE_HALF_CYCLE_MS);
+      }
+
+      applyMixedPolarity(dutyApermille, nowUs);
+      break;
+    }
     case Mode::Count:
       break;
   }
